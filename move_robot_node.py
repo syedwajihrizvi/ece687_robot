@@ -1,142 +1,174 @@
+#!/usr/bin/env python3
+"""
+move_robot_node.py  -- COMPLIANT REWRITE of the teammate's chassis controller.
+
+Project requirement (ECE 486/687, Sec. 1.1):
+  The robot is modeled as a UNICYCLE:
+        x_dot = v cos(theta)
+        y_dot = v sin(theta)
+        theta_dot = omega
+  i.e. the ONLY inputs are v (Twist.linear.x) and omega (Twist.angular.z).
+  Twist.linear.y MUST stay 0, even though the EP mecanum base could strafe.
+
+Control method (required): APPROXIMATE LINEARIZATION (Sec. 1.1, eqs. 2-3).
+  Define a point p a distance l in front of the robot -- chosen to coincide
+  with the tip of the stick:
+        p = [x + l cos(theta);  y + l sin(theta)]
+  Its motion is
+        p_dot = R(theta) L(l) [v; omega],   L(l)=diag(1, l)            (eq. 2)
+  so, once we design a controller for p_dot, we recover the unicycle inputs by
+        [v; omega] = L^-1(l) R^T(theta) p_dot                          (eq. 3)
+  We use the simple proportional point controller  p_dot = Kp (p_des - p).
+
+This replaces the previous version, which published Twist.linear.y (holonomic
+strafing) and therefore (a) violated the unicycle model and (b) never turned
+toward the target -- it slid sideways instead.
+
+Division of labour:
+  * THIS node positions the robot so the gripper point p reaches the target
+    (T1 navigate-to-stick, T3 navigate-to-puck, etc.).
+  * stick_grabber_node.py handles the arm height + gripper (T2).
+
+Run (inside the container, robot + vrpn_mocap up):
+  python3 move_robot_node.py --ros-args \
+    -p robot:=robot3 \
+    -p target_topic:=/vrpn_mocap/hockey_sticks_1/pose \
+    -p l:=0.20 -p v_max:=0.25
+"""
+
+import math
+
+import numpy as np
 import rclpy
 from rclpy.node import Node
-from rclpy.executors import MultiThreadedExecutor
 from rclpy.qos import QoSProfile, ReliabilityPolicy
-import numpy as np
-import math
-from geometry_msgs.msg import PoseStamped, Twist
+from geometry_msgs.msg import Twist, PoseStamped
 
-class MecanumBaseController(Node):
+
+def yaw_from_quat(q) -> float:
+    """Extract the planar heading (yaw) from a quaternion."""
+    siny_cosp = 2.0 * (q.w * q.z + q.x * q.y)
+    cosy_cosp = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
+    return math.atan2(siny_cosp, cosy_cosp)
+
+
+class UnicycleApproxLinController(Node):
     def __init__(self):
-        super().__init__('mecanum_base_controller')
+        super().__init__('move_robot_node')
 
-        mocap_qos = QoSProfile(
-            reliability=ReliabilityPolicy.BEST_EFFORT,
-            depth=10
-        )
-        # Publishers
-        self.cmd_vel_pub = self.create_publisher(Twist, '/robot3/cmd_vel', 10)
-        self.create_subscription(PoseStamped, '/vrpn_mocap/hockey_sticks_1/pose', self.stick_mocap_callback, mocap_qos) 
+        # ---- parameters (defaults match the teammate's tested setup) --------
+        robot = self.declare_parameter('robot', 'robot3').value
+        self.declare_parameter('cmd_vel_topic', f'/{robot}/cmd_vel')
+        self.declare_parameter('robot_pose_topic', f'/vrpn_mocap/dji_robot_3/pose')
+        self.declare_parameter('target_topic', f'/vrpn_mocap/hockey_sticks_1/pose')
 
-        # Storage
-        self.robot_pose = None
-        self.robot_orientation = None
-        self.stick_pose = None
-        self.stick_orientation = None
+        # geometry / gains
+        self.l = self.declare_parameter('l', 0.20).value          # offset of point p (m)
+        self.Kp = self.declare_parameter('Kp', 1.0).value         # point P-gain
+        self.v_max = self.declare_parameter('v_max', 0.25).value  # forward speed cap (m/s)
+        self.w_max = self.declare_parameter('w_max', 1.5).value   # yaw-rate cap (rad/s)
+        self.pos_tol = self.declare_parameter('pos_tol', 0.04).value  # arrival tol (m)
 
-        # Subscriptions
-        self.create_subscription(PoseStamped, '/vrpn_mocap/hockey_sticks_1/pose', self.stick_mocap_callback, mocap_qos) 
-        self.create_subscription(PoseStamped, '/vrpn_mocap/dji_robot_3/pose', self.robot_pose_callback, mocap_qos)
-        
-        # Controller Parameters
-        self.Kp_linear = 1.5
-        self.Kp_angular = 2.0
-        self.MAX_SPEED = 0.3
-        self.MAX_ANGULAR_SPEED = 1.0
-        self.TARGET_FORWARD_OFFSET = 0.15
-        self.LINEAR_THRESHOLD = 0.05
-        self.ANGULAR_THRESHOLD = 0.05
+        # optional: rotate in place to a desired final heading after arriving
+        self.align_final = self.declare_parameter('align_final_yaw', False).value
+        self.goal_yaw = self.declare_parameter('goal_yaw', 0.0).value
+        self.yaw_tol = self.declare_parameter('yaw_tol', 0.05).value
 
-        self.timer = self.create_timer(0.05, self.control_loop)
-        self.get_logger().info("Mecanum base controller node has been started.")
+        # ---- state ----------------------------------------------------------
+        self.robot = None     # np.array([x, y, theta])
+        self.target = None    # np.array([x, y])
+        self._arrived = False
 
-    def robot_pose_callback(self, msg):
-        print("SYED-DEBUG: Running callback for robot pose")
-        self.robot_pose = msg.pose.position
-        self.robot_orientation = msg.pose.orientation 
-        print("SYED-DEBUG: Robot pose updated:", self.robot_pose)
-        print("SYED-DEBUG: Robot orientation updated:", self.robot_orientation)
+        mocap_qos = QoSProfile(reliability=ReliabilityPolicy.BEST_EFFORT, depth=10)
+        self.create_subscription(PoseStamped, self.get_parameter('robot_pose_topic').value,
+                                 self._on_robot, mocap_qos)
+        self.create_subscription(PoseStamped, self.get_parameter('target_topic').value,
+                                 self._on_target, mocap_qos)
+        self.cmd_pub = self.create_publisher(Twist, self.get_parameter('cmd_vel_topic').value, 10)
 
-    def stick_mocap_callback(self, msg):
-        print("SYED-DEBUG: Running callback for stick pose")
-        self.stick_pose = msg.pose.position
-        self.stick_orientation = msg.pose.orientation
-        print("SYED-DEBUG: Stick pose updated:", self.stick_pose)
-        print("SYED-DEBUG: Stick orientation updated:", self.stick_orientation)
+        self.timer = self.create_timer(0.05, self.control_loop)   # 20 Hz
+        self.get_logger().info('move_robot_node started (unicycle + approx. linearization).')
 
-    def _compute_local_errors(self):
-        if self.robot_pose is None or self.stick_pose is None or self.stick_orientation is None:
-            print(f"SYED-DEBUG: {self.robot_pose}, {self.stick_pose}, {self.stick_orientation}")
-            return None
-        
-        dx_global = self.stick_pose.x - self.robot_pose.x
-        dy_global = self.stick_pose.y - self.robot_pose.y
+    # ------------------------------------------------------------------ I/O
+    def _on_robot(self, msg: PoseStamped):
+        self.robot = np.array([msg.pose.position.x, msg.pose.position.y,
+                               yaw_from_quat(msg.pose.orientation)])
 
-        q_r = self.robot_orientation
-        siny_cosp_r = 2 * (q_r.w * q_r.z + q_r.x * q_r.y)
-        cosy_cosp_r = 1 - 2 * (q_r.y * q_r.y + q_r.z * q_r.z)
-        robot_yaw = math.atan2(siny_cosp_r, cosy_cosp_r)
+    def _on_target(self, msg: PoseStamped):
+        self.target = np.array([msg.pose.position.x, msg.pose.position.y])
 
-        q_s = self.stick_orientation
-        siny_cosp_s = 2 * (q_s.w * q_s.z + q_s.x * q_s.y)
-        cosy_cosp_s = 1 - 2 * (q_s.y * q_s.y + q_s.z * q_s.z)
-        stick_yaw = math.atan2(siny_cosp_s, cosy_cosp_s)
+    def control_point(self) -> np.ndarray:
+        """Point p a distance l in front of the robot (= stick tip)."""
+        x, y, th = self.robot
+        return np.array([x + self.l * math.cos(th), y + self.l * math.sin(th)])
 
-        dx_local = dx_global * math.cos(robot_yaw) + dy_global * math.sin(robot_yaw)
-        dy_local = -dx_global * math.sin(robot_yaw) + dy_global * math.cos(robot_yaw)
+    def stop(self):
+        self.cmd_pub.publish(Twist())   # all zeros
 
-        error_x = dx_local - self.TARGET_FORWARD_OFFSET
-        error_y = dy_local
-        error_yaw = stick_yaw - robot_yaw
-
-        error_yaw = math.atan2(math.sin(error_yaw), math.cos(error_yaw))
-
-        return error_x, error_y, error_yaw
-
+    # ------------------------------------------------------- control loop
     def control_loop(self):
-            print("SYED-DEBUG: Control loop is running")
-            errors = self._compute_local_errors()
-            if errors is None:
-                print("SYED-DEBUG: Error is none")
-                return
-            error_x, error_y, error_yaw = errors
-            if abs(error_x) < self.LINEAR_THRESHOLD and abs(error_y) < self.LINEAR_THRESHOLD and abs(error_yaw) < self.ANGULAR_THRESHOLD:
-                print("SYED-DEBUG: Threshold reached")
-                self.stop_chassis()
-                return
-            
-            vx = error_x * self.Kp_linear
-            vy = error_y * self.Kp_linear
-            wz = error_yaw * self.Kp_angular
+        if self.robot is None or self.target is None:
+            return
 
-            vx = np.clip(vx, -self.MAX_SPEED, self.MAX_SPEED)
-            vy = np.clip(vy, -self.MAX_SPEED, self.MAX_SPEED)
-            wz = np.clip(wz, -self.MAX_ANGULAR_SPEED, self.MAX_ANGULAR_SPEED)       
+        p = self.control_point()
+        dist = float(np.linalg.norm(self.target - p))
 
-            # Direct, clean assignment matching the computed frame velocities
-            twist_msg = Twist()
-            twist_msg.linear.x = float(vx)   # No inversion!
-            twist_msg.linear.y = float(vy)   # No inversion!
-            twist_msg.angular.z = float(wz)
-            
-            print(f"SYED-DEBUG: Computed velocities - vx: {vx:.2f}, vy: {vy:.2f}, wz: {wz:.4f}")
-            print(f"SYED-DEBUG: Publishing Twist - Linear: ({twist_msg.linear.x:.2f}, {twist_msg.linear.y:.2f}), Angular: {twist_msg.angular.z:.4f}")
-            self.cmd_vel_pub.publish(twist_msg)
+        # ---- arrival handling ------------------------------------------
+        if dist < self.pos_tol:
+            if self.align_final and not self._arrived:
+                self.get_logger().info('Reached target -> aligning final heading.')
+            self._arrived = True
+            if self.align_final:
+                self._rotate_to_yaw()
+            else:
+                self.stop()
+            return
+        self._arrived = False
 
-    def stop_chassis(self):
-        twist_msg = Twist()
-        twist_msg.linear.x = 0.0
-        twist_msg.linear.y = 0.0
-        twist_msg.angular.z = 0.0
-        self.cmd_vel_pub.publish(twist_msg)
-        self.get_logger().info("Chassis stopped.")
+        # ---- approximate linearization (eqs. 2-3) ----------------------
+        # 1) design point velocity:  p_dot = Kp (p_des - p)
+        p_dot = self.Kp * (self.target - p)
+
+        # 2) saturate the *point* speed (keeps v, omega bounded together)
+        speed = np.linalg.norm(p_dot)
+        if speed > self.v_max:
+            p_dot *= self.v_max / speed
+
+        # 3) map back to unicycle inputs:  [v; omega] = L^-1 R^T p_dot
+        x, y, th = self.robot
+        c, s = math.cos(th), math.sin(th)
+        v = c * p_dot[0] + s * p_dot[1]
+        w = (-s * p_dot[0] + c * p_dot[1]) / self.l
+
+        tw = Twist()
+        tw.linear.x = float(v)
+        tw.linear.y = 0.0                       # <-- unicycle: NEVER strafe
+        tw.angular.z = float(np.clip(w, -self.w_max, self.w_max))
+        self.cmd_pub.publish(tw)
+
+    def _rotate_to_yaw(self):
+        """Pure in-place rotation to goal_yaw (still unicycle: v=0)."""
+        _, _, th = self.robot
+        err = math.atan2(math.sin(self.goal_yaw - th), math.cos(self.goal_yaw - th))
+        tw = Twist()
+        if abs(err) > self.yaw_tol:
+            tw.angular.z = float(np.clip(self.Kp * err, -self.w_max, self.w_max))
+        self.cmd_pub.publish(tw)
 
 
 def main(args=None):
     rclpy.init(args=args)
-    node = MecanumBaseController()
-
-    executor = MultiThreadedExecutor()
-    executor.add_node(node)
+    node = UnicycleApproxLinController()
     try:
-        executor.spin()
+        rclpy.spin(node)
     except KeyboardInterrupt:
         pass
     finally:
-        node.stop_chassis()
+        node.stop()
         node.destroy_node()
         if rclpy.ok():
             rclpy.shutdown()
+
 
 if __name__ == '__main__':
     main()
